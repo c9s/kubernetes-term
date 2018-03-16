@@ -1,0 +1,16 @@
+{
+  "name": "kubernetes-term",
+  "description": "Provides a terminal for a kubernetes container in a pod.",
+  "author": "Yo-An Lin",
+  "version": "1.0.0",
+  "license": "MIT",
+  "devDependencies": {
+    "bower": "*"
+  },
+  "dependencies": {
+    "font-awesome": "*",
+    "jquery": "^3.3.1",
+    "socket.io-client": "^2.0.4",
+    "xterm": "^3.2.0"
+  }
+}

@@ -1,0 +1,108 @@
+<!doctype html>
+  <html>
+    <head>
+      <link rel="stylesheet" href="node_modules/xterm/dist/xterm.css" />
+      <script src="node_modules/jquery/dist/jquery.min.js"></script>
+      <script src="node_modules/socket.io-client/dist/socket.io.js"></script>
+      <script src="node_modules/xterm/dist/xterm.js"></script>
+      <script src="node_modules/xterm/dist/addons/fit/fit.js"></script>
+      <script src="node_modules/xterm/dist/addons/webLinks/webLinks.js"></script>
+    </head>
+    <body>
+      <div id="terminal"></div>
+      <script>
+$(function() {
+    Terminal.applyAddon(fit);
+    Terminal.applyAddon(webLinks);
+
+    var term = new Terminal({
+        macOptionIsMeta: true,
+        cursorBlink: true,
+        // scrollback: 10,
+        // tabStopWidth: 10,
+
+        /*
+        macOptionIsMeta: optionElements.macOptionIsMeta.enabled,
+        cursorBlink: optionElements.cursorBlink.checked,
+        scrollback: parseInt(optionElements.scrollback.value, 10),
+        tabStopWidth: parseInt(optionElements.tabstopwidth.value, 10),
+        screenReaderMode: optionElements.screenReaderMode.checked
+        */
+    });
+    term.open(document.getElementById('terminal'));
+    term.write('Hello from \033[1;3;31mxterm.js\033[0m $ ')
+    term.writeln('Welcome to xterm.js');
+    term.writeln('Connecting to the kubernetes pod...');
+    term.writeln('');
+
+    term.fit();
+    term.webLinksInit();
+    term.focus();
+
+    term.__flushBuffer = function() {
+        term.write(term.__socketBuffer);
+        term.__socketBuffer = null;
+    };
+
+    term.__pushToBuffer = function(data) {
+        if (term.__socketBuffer) {
+            term.__socketBuffer += data;
+        } else {
+            term.__socketBuffer = data;
+            setTimeout(term.__flushBuffer, 10);
+        }
+    };
+
+    var handleTermOutput = function(data) {
+        let str;
+        if (typeof data === 'object') {
+            if (data instanceof ArrayBuffer) {
+                if (!myTextDecoder) {
+                    myTextDecoder = new TextDecoder();
+                }
+
+                str = myTextDecoder.decode(data);
+            } else {
+                throw 'TODO: handle Blob?';
+            }
+        }
+        term.write(str || data);
+    };
+
+    var handleTermTerminated = function() {
+        console.info("terminal session is terminated");
+    };
+
+    var socket = io();
+
+    socket.on('error', function(data) {
+        console.error(data);
+    });
+
+
+    socket.on('connect', function() {
+        console.info("connect");
+        term.writeln('container connected.');
+
+        socket.on('term:stdout', handleTermOutput);
+        socket.on('term:stderr', handleTermOutput);
+        socket.on('term:terminated', handleTermTerminated);
+
+        term.on("data", function(data) {
+            console.info("term:stdin", data);
+            socket.emit("term:stdin", data);
+        });
+
+        term.on('resize', function (size) {
+            console.info("resize", size);
+            socket.emit("term:resize", JSON.stringify(size));
+        });
+    });
+
+    socket.on('disconnect', function() {
+        console.info("disconnected");
+    });
+});
+      </script>
+    </body>
+</html>

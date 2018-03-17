@@ -20,21 +20,13 @@ import (
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 
-	api "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	// "k8s.io/apimachinery/pkg/runtime"
-	// "k8s.io/apimachinery/pkg/runtime/schema"
-
-	// "k8s.io/client-go/pkg/api"
 	"k8s.io/client-go/tools/remotecommand"
 
 	scheme "k8s.io/client-go/kubernetes/scheme"
 
-	// "k8s.io/kubernetes/pkg/util/interrupt"
-
-	// "k8s.io/apimachinery/pkg/runtime"
-
-	// socket.io
 	socketio "github.com/c9s/go-socket.io"
 )
 
@@ -79,6 +71,12 @@ func Load(context string, kubeconfig string) (*rest.Config, error) {
 func LoadConfig() (*rest.Config, error) {
 	return Load("gke_linker-aurora_asia-east1-a_aurora-prod", "")
 	// return Load("gke_linker-aurora_asia-east1-a_aurora-jenkins", "")
+}
+
+type TermConnectPayload struct {
+	Namespace     string `json:"namespace"`
+	PodName       string `json:"pod"`
+	ContainerName string `json:"container"`
 }
 
 type TermSizePayload struct {
@@ -126,8 +124,42 @@ func (w *SocketIoWriter) Write(p []byte) (n int, err error) {
 	if err := w.Socket.Emit(w.Event, data); err != nil {
 		log.Println("emit error:", err)
 	}
-	log.Printf("emit %s -> '%s'", w.Event, data)
+	log.Printf("emit %s -> '%v'", w.Event, p)
 	return len(p), err
+}
+
+func NewExecRequest(clientset *kubernetes.Clientset, p TermConnectPayload) *rest.Request {
+	rest := clientset.RESTClient()
+	req := rest.Post().
+		Prefix("/api/v1").
+		Resource("pods").
+		Name(p.PodName).
+		Namespace("default").
+		SubResource("exec").
+		Param("container", p.ContainerName).
+		Param("stdin", "true").
+		Param("stdout", "true").
+		Param("stderr", "true").
+		Param("tty", "true").
+		Param("command", "/bin/sh")
+
+	req.VersionedParams(&corev1.PodExecOptions{
+		Container: p.ContainerName,
+		Command:   []string{"sh"},
+
+		// turn on the stdin if we have the input device connected
+		Stdin: true,
+
+		// read the stdout
+		Stdout: true,
+
+		// read the stderr
+		Stderr: true,
+
+		// tty is not allocated for the call
+		TTY: false,
+	}, scheme.ParameterCodec)
+	return req
 }
 
 func main() {
@@ -149,109 +181,107 @@ func main() {
 
 	// Get topic from client, and add client to topic
 	io.On("connection", func(socket socketio.Socket) {
-		log.Printf("Client connected: id=%s", socket.Id())
+		log.Printf("client connected: id=%s", socket.Id())
 
 		// emit an "open" message to the client
 		socket.Emit("open")
 
-		stdoutHandler := SocketIoWriter{
+		var rawTerm = true
+
+		var stdoutWriter = SocketIoWriter{
 			Event:  "term:stdout",
 			Socket: socket,
 		}
-		stderrHandler := SocketIoWriter{
+
+		var stderrWriter = SocketIoWriter{
 			Event:  "term:stderr",
 			Socket: socket,
 		}
-		stdinHandler := SocketIoReader{
+
+		var stdinReader = SocketIoReader{
 			Event:  "term:stdin",
 			Socket: socket,
 			Buffer: make(chan []byte, 30),
 		}
 
-		podName := "mongo-0"
-		containerName := "mongo"
-		rawTerm := true
-
 		var sizeQueue = &SocketIoSizeQueue{
 			C: make(chan *remotecommand.TerminalSize, 10),
 		}
 
-		// run the goroutine
-		fn := func() error {
-			rest := clientset.RESTClient()
-			req := rest.Post().
-				Prefix("/api/v1").
-				Resource("pods").
-				Name(podName).
-				Namespace("default").
-				SubResource("exec").
-				Param("container", containerName).
-				Param("stdin", "true").
-				Param("stdout", "true").
-				Param("stderr", "true").
-				Param("tty", "true").
-				Param("command", "/bin/sh")
+		socket.On("term:connect", func(data string) {
+			p := TermConnectPayload{}
+			if err := json.Unmarshal([]byte(data), &p); err != nil {
+				log.Println("json decode failed:", err)
+				return
+			}
 
-			req.VersionedParams(&api.PodExecOptions{
-				Container: containerName,
-				Command:   []string{"sh"},
+			if len(p.Namespace) == 0 {
+				p.Namespace = "default"
+			}
 
-				// turn on the stdin if we have the input device connected
-				Stdin: false,
+			if len(p.PodName) == 0 {
+				log.Println("pod name must be specified")
+				return
+			}
 
-				// read the stdout
-				Stdout: true,
-
-				// read the stderr
-				Stderr: true,
-
-				TTY: true,
-			}, scheme.ParameterCodec)
-
-			log.Println(req.URL())
-			log.Printf("%v\n", req)
-
-			exec, err := remotecommand.NewSPDYExecutor(restConfig, http.MethodPost, req.URL())
+			pod, err := clientset.Core().Pods(p.Namespace).Get(p.PodName, metav1.GetOptions{})
 			if err != nil {
-				log.Print("failed to create spdy executor")
-				return err
+				log.Printf("pod %s not found.", p.PodName)
+				return
 			}
+			_ = pod
 
-			return exec.Stream(remotecommand.StreamOptions{
-				Stdin:             &stdinHandler,
-				Stdout:            &stdoutHandler,
-				Stderr:            &stderrHandler,
-				Tty:               rawTerm,
-				TerminalSizeQueue: sizeQueue,
-			})
-		}
+			// run the goroutine
+			fn := func() error {
+				req := NewExecRequest(clientset, p)
 
-		go func() {
-			log.Println("Sending exec request ...")
-			if err := fn(); err != nil {
-				log.Fatal("container exec connection failed:", err)
+				log.Println("Created request:", req.URL())
+
+				exec, err := remotecommand.NewSPDYExecutor(restConfig, http.MethodPost, req.URL())
+				if err != nil {
+					log.Print("failed to create spdy executor")
+					return err
+				}
+
+				socket.Emit("term:connected")
+
+				// start streaming
+				return exec.Stream(remotecommand.StreamOptions{
+					Stdin:             &stdinReader,
+					Stdout:            &stdoutWriter,
+					Stderr:            &stderrWriter,
+					Tty:               rawTerm,
+					TerminalSizeQueue: sizeQueue,
+				})
 			}
-			log.Println("exec connection terminated.")
+			go func() {
+				log.Println("Sending exec request ...")
+				if err := fn(); err != nil {
+					log.Fatal("container exec connection failed:", err)
+				}
+				log.Println("exec connection terminated.")
+				socket.Emit("term:terminated")
+			}()
+		})
 
-			socket.Emit("term:terminated")
-		}()
+		socket.On("term:stdin", func(data string) {
+			stdinReader.Write([]byte(data))
+		})
 
 		socket.On("term:resize", func(data string) {
-			payload := TermSizePayload{}
-			err := json.Unmarshal([]byte(data), &payload)
+			log.Printf("term:resize %s", data)
+
+			p := TermSizePayload{}
+			err := json.Unmarshal([]byte(data), &p)
 			if err != nil {
 				log.Println("term:resize error:", err)
 				return
 			}
-			sizeQueue.Push(payload.Columns, payload.Rows)
-		})
-
-		socket.On("term:stdin", func(data string) {
-			stdinHandler.Write([]byte(data))
+			sizeQueue.Push(p.Columns, p.Rows)
 		})
 
 		socket.On("disconnection", func(data string) {
-			log.Printf("Client disconnected. id=%s", socket.Id())
+			log.Printf("client disconnected. id=%s", socket.Id())
 		})
 	})
 
